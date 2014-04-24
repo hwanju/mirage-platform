@@ -56,7 +56,7 @@ void print(const char *fmt, va_list args)
     static char   buf[1024];
     
     (void)vsnprintf(buf, sizeof(buf), fmt, args);
-//    (void)HYPERVISOR_console_io(CONSOLEIO_write, strlen(buf), buf);
+    (void)HYPERVISOR_console_io(CONSOLEIO_write, strlen(buf), buf);
 
     xencons_ring_send(NULL, buf, strlen(buf));
 }

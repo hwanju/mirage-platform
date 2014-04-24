@@ -197,6 +197,9 @@ static evtchn_port_t port;
 void init_time(void)
 {
     printk("Initialising timer interface\n");
+    if (xen_feature(XENFEAT_hvm_callback_vector))
+        if (HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, 0 /* cpu */, NULL))
+		    BUG();
     if (!evtchn_bind_virq(VIRQ_TIMER, &port))
       unmask_evtchn(port);
 }
@@ -204,5 +207,11 @@ void init_time(void)
 void fini_time(void)
 {
     /* Clear any pending timer */
-    HYPERVISOR_set_timer_op(0);
+    if (!xen_feature(XENFEAT_hvm_callback_vector))
+        HYPERVISOR_set_timer_op(0);
+    else {
+		if (HYPERVISOR_vcpu_op(VCPUOP_stop_singleshot_timer, 0 /* cpu */, NULL) ||
+		    HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, 0 /* cpu */, NULL))
+			BUG();
+    }
 }

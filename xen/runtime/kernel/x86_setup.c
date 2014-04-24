@@ -61,13 +61,17 @@ shared_info_t *map_shared_info(unsigned long pa)
 {
     int rc;
 
-    if ( (rc = HYPERVISOR_update_va_mapping(
-              (unsigned long)shared_info, __pte(pa | 7), UVMF_INVLPG)) )
-    {
-        printk("Failed to map shared_info!! rc=%d\n", rc);
-        do_exit();
+    if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+        if ( (rc = HYPERVISOR_update_va_mapping(
+                        (unsigned long)shared_info, __pte(pa | 7), UVMF_INVLPG)) )
+        {
+            printk("Failed to map shared_info!! rc=%d\n", rc);
+            do_exit();
+        }
+	    return (shared_info_t *)shared_info;
     }
-    return (shared_info_t *)shared_info;
+    else
+		return (shared_info_t *)to_virt(start_info.shared_info);
 }
 
 void unmap_shared_info()
@@ -84,15 +88,18 @@ arch_init(start_info_t *si)
     xen_info = si;
 
     /* set up minimal memory infos */
-    phys_to_machine_mapping = (unsigned long *)start_info.mfn_list;
+	if (!xen_feature(XENFEAT_auto_translated_physmap))
+        phys_to_machine_mapping = (unsigned long *)start_info.mfn_list;
 
     /* Grab the shared_info pointer and put it in a safe place. */
     HYPERVISOR_shared_info = map_shared_info(start_info.shared_info);
 
     /* Set up event and failsafe callback addresses. */
-    HYPERVISOR_set_callbacks(
-        (unsigned long)hypervisor_callback,
-        (unsigned long)failsafe_callback, 0);
+    if (!xen_feature(XENFEAT_hvm_callback_vector)) {
+        HYPERVISOR_set_callbacks(
+                (unsigned long)hypervisor_callback,
+                (unsigned long)failsafe_callback, 0);
+    }
 }
 
 void

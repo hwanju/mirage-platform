@@ -21,6 +21,9 @@
 #include <caml/memory.h>
 #include <caml/callback.h>
 
+#include <xen/vcpu.h>
+#include <errno.h>          
+
 void _exit(int);
 int errno;
 static char *argv[] = { "mirage", NULL };
@@ -31,11 +34,21 @@ caml_block_domain(value v_timeout)
 {
   CAMLparam1(v_timeout);
   s_time_t block_nsecs = (s_time_t)(Double_val(v_timeout) * 1000000000);
-  HYPERVISOR_set_timer_op(NOW() + block_nsecs);
+  if (!xen_feature(XENFEAT_hvm_callback_vector))
+    HYPERVISOR_set_timer_op(NOW() + block_nsecs);
+  else {
+    struct vcpu_set_singleshot_timer single;
+    int ret;
+
+    single.timeout_abs_ns = NOW() + block_nsecs;
+    single.flags = VCPU_SSHOTTMR_future;
+    ret = HYPERVISOR_vcpu_op(VCPUOP_set_singleshot_timer, 0 /* cpu */, &single);
+    BUG_ON(ret != 0 && ret != -ETIME);
+  }
   /* xen/common/schedule.c:do_block clears evtchn_upcall_mask
      to re-enable interrupts. It blocks the domain and immediately
      checks for pending events which otherwise may be missed. */
-  HYPERVISOR_sched_op(SCHEDOP_block, 0);
+  safe_halt();
   /* set evtchn_upcall_mask: there's no need to be interrupted
      when we know we have outstanding work to do. When we next
      call this function, the call to SCHEDOP_block will check

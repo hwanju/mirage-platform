@@ -102,27 +102,35 @@ static void new_pt_frame(unsigned long *pt_pfn, unsigned long prev_l_mfn,
     tab = pte_to_virt(tab[l4_table_offset(pt_page)]);
     tab = pte_to_virt(tab[l3_table_offset(pt_page)]);
 
-    mmu_updates[0].ptr = (tab[l2_table_offset(pt_page)] & PAGE_MASK) + 
-        sizeof(pgentry_t) * l1_table_offset(pt_page);
-    mmu_updates[0].val = (pgentry_t)pfn_to_mfn(*pt_pfn) << PAGE_SHIFT | 
-        (prot_e & ~_PAGE_RW);
-    
-    if ( (rc = HYPERVISOR_mmu_update(mmu_updates, 1, NULL, DOMID_SELF)) < 0 )
-    {
-        printk("ERROR: PTE for new page table page could not be updated\n");
-        printk("       mmu_update failed with rc=%d\n", rc);
-        do_exit();
+    if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+        mmu_updates[0].ptr = (tab[l2_table_offset(pt_page)] & PAGE_MASK) + 
+            sizeof(pgentry_t) * l1_table_offset(pt_page);
+        mmu_updates[0].val = (pgentry_t)pfn_to_mfn(*pt_pfn) << PAGE_SHIFT | 
+            (prot_e & ~_PAGE_RW);
+
+        if ( (rc = HYPERVISOR_mmu_update(mmu_updates, 1, NULL, DOMID_SELF)) < 0 )
+        {
+            printk("ERROR: PTE for new page table page could not be updated\n");
+            printk("       mmu_update failed with rc=%d\n", rc);
+            do_exit();
+        }
+
+        /* Hook the new page table page into the hierarchy */
+        mmu_updates[0].ptr =
+            ((pgentry_t)prev_l_mfn << PAGE_SHIFT) + sizeof(pgentry_t) * offset;
+        mmu_updates[0].val = (pgentry_t)pfn_to_mfn(*pt_pfn) << PAGE_SHIFT | prot_t;
+
+        if ( (rc = HYPERVISOR_mmu_update(mmu_updates, 1, NULL, DOMID_SELF)) < 0 ) 
+        {
+            printk("ERROR: mmu_update failed with rc=%d\n", rc);
+            do_exit();
+        }
     }
-
-    /* Hook the new page table page into the hierarchy */
-    mmu_updates[0].ptr =
-        ((pgentry_t)prev_l_mfn << PAGE_SHIFT) + sizeof(pgentry_t) * offset;
-    mmu_updates[0].val = (pgentry_t)pfn_to_mfn(*pt_pfn) << PAGE_SHIFT | prot_t;
-
-    if ( (rc = HYPERVISOR_mmu_update(mmu_updates, 1, NULL, DOMID_SELF)) < 0 ) 
-    {
-        printk("ERROR: mmu_update failed with rc=%d\n", rc);
-        do_exit();
+    else {
+        /* Unlike auto-translated, we only need to set the previous-level page table
+         * due to no need to relinquish RW from L1 table pointing to it */
+        pgentry_t *prev_l_vaddr = mfn_to_virt(prev_l_mfn);
+        prev_l_vaddr[offset] = (pgentry_t)pfn_to_mfn(*pt_pfn) << PAGE_SHIFT | prot_t;
     }
 
     *pt_pfn += 1;
@@ -245,21 +253,27 @@ static void build_pagetable(unsigned long *start_pfn, unsigned long *max_pfn)
         pt_mfn = pte_to_mfn(page);
         offset = l1_table_offset(start_address);
 
-        mmu_updates[count].ptr =
-            ((pgentry_t)pt_mfn << PAGE_SHIFT) + sizeof(pgentry_t) * offset;
-        mmu_updates[count].val = 
-            (pgentry_t)pfn_to_mfn(pfn_to_map++) << PAGE_SHIFT | L1_PROT;
-        count++;
-        if ( count == L1_PAGETABLE_ENTRIES || pfn_to_map == *max_pfn )
-        {
-            rc = HYPERVISOR_mmu_update(mmu_updates, count, NULL, DOMID_SELF);
-            if ( rc < 0 )
+        if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+            mmu_updates[count].ptr =
+                ((pgentry_t)pt_mfn << PAGE_SHIFT) + sizeof(pgentry_t) * offset;
+            mmu_updates[count].val = 
+                (pgentry_t)pfn_to_mfn(pfn_to_map++) << PAGE_SHIFT | L1_PROT;
+            count++;
+            if ( count == L1_PAGETABLE_ENTRIES || pfn_to_map == *max_pfn )
             {
-                printk("ERROR: build_pagetable(): PTE could not be updated\n");
-                printk("       mmu_update failed with rc=%d\n", rc);
-                do_exit();
+                rc = HYPERVISOR_mmu_update(mmu_updates, count, NULL, DOMID_SELF);
+                if ( rc < 0 )
+                {
+                    printk("ERROR: build_pagetable(): PTE could not be updated\n");
+                    printk("       mmu_update failed with rc=%d\n", rc);
+                    do_exit();
+                }
+                count = 0;
             }
-            count = 0;
+        }
+        else {
+            pgentry_t *pt_vaddr = mfn_to_virt(pt_mfn);
+            pt_vaddr[offset] = (pgentry_t)pfn_to_mfn(pfn_to_map++) << PAGE_SHIFT | L1_PROT;
         }
         start_address += PAGE_SIZE;
     }
@@ -308,18 +322,23 @@ static void set_readonly(void *text, void *etext)
 
         if ( start_address != (unsigned long)&shared_info )
         {
-            mmu_updates[count].ptr = 
-                ((pgentry_t)mfn << PAGE_SHIFT) + sizeof(pgentry_t) * offset;
-            mmu_updates[count].val = tab[offset] & ~_PAGE_RW;
-            count++;
+            if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+                mmu_updates[count].ptr = 
+                    ((pgentry_t)mfn << PAGE_SHIFT) + sizeof(pgentry_t) * offset;
+                mmu_updates[count].val = tab[offset] & ~_PAGE_RW;
+                count++;
+            }
+            else
+                tab[offset] &= ~_PAGE_RW;
         }
         else
             printk("skipped %p\n", start_address);
 
         start_address += PAGE_SIZE;
 
-        if ( count == L1_PAGETABLE_ENTRIES || 
-             start_address + PAGE_SIZE > end_address )
+        if ( !xen_feature(XENFEAT_auto_translated_physmap) && 
+            (count == L1_PAGETABLE_ENTRIES || 
+             start_address + PAGE_SIZE > end_address) )
         {
             rc = HYPERVISOR_mmu_update(mmu_updates, count, NULL, DOMID_SELF);
             if ( rc < 0 )
@@ -331,13 +350,7 @@ static void set_readonly(void *text, void *etext)
         }
     }
 
-    {
-        mmuext_op_t op = {
-            .cmd = MMUEXT_TLB_FLUSH_ALL,
-        };
-        int count;
-        HYPERVISOR_mmuext_op(&op, 1, &count, DOMID_SELF);
-    }
+    flush_tlb_global();
 }
 
 /*
@@ -553,13 +566,13 @@ void do_map_frames(unsigned long va,
     unsigned long i;
     int rc;
 
-    if ( !mfns ) 
+    if ( !xen_feature(XENFEAT_auto_translated_physmap) && !mfns ) 
     {
         printk("do_map_frames: no mfns supplied\n");
         return;
     }
     DEBUG("va=%p n=0x%lx, mfns[0]=0x%lx stride=0x%lx incr=0x%lx prot=0x%lx\n",
-          va, n, mfns[0], stride, incr, prot);
+          va, n, mfns ? mfns[0] : 0, stride, incr, prot);
  
     while ( done < n )
     {
@@ -582,21 +595,32 @@ void do_map_frames(unsigned long va,
                 if ( !pgt || !(va & L1_MASK) )
                     pgt = need_pgt(va, superpage, 1);
                 
-                mmu_updates[i].ptr = virt_to_mach(pgt) | MMU_NORMAL_PT_UPDATE;
-                mmu_updates[i].val = ((pgentry_t)(mfns[(done + i) * stride] +
-                                                  (done + i) * incr)
-                                      << PAGE_SHIFT) | prot;
+                if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+                    mmu_updates[i].ptr = virt_to_mach(pgt) | MMU_NORMAL_PT_UPDATE;
+                    mmu_updates[i].val = ((pgentry_t)(mfns[(done + i) * stride] +
+                                (done + i) * incr)
+                            << PAGE_SHIFT) | prot;
+                }
+                else {
+                    if (mfns)
+                        *pgt = ((pgentry_t)(mfns[(done + i) * stride] +
+                                (done + i) * incr) << PAGE_SHIFT) | prot;
+                    else        /* for grant table */
+                        *pgt = (to_phys(va) & PAGE_MASK) | prot;
+                }
             }
 
-            rc = HYPERVISOR_mmu_update(mmu_updates, todo, NULL, id);
-            if ( rc < 0 )
-            {
-                if (may_fail)
-                    mfns[done * stride] |= 0xF0000000;
-                else {
-                    printk("Map %ld (%lx, ...) at %p failed: %d.\n",
-                           todo, mfns[done * stride] + done * incr, va, rc);
-                    do_exit();
+            if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+                rc = HYPERVISOR_mmu_update(mmu_updates, todo, NULL, id);
+                if ( rc < 0 )
+                {
+                    if (may_fail)
+                        mfns[done * stride] |= 0xF0000000;
+                    else {
+                        printk("Map %ld (%lx, ...) at %p failed: %d.\n",
+                                todo, mfns[done * stride] + done * incr, va, rc);
+                        do_exit();
+                    }
                 }
             }
         }
@@ -841,8 +865,15 @@ static void clear_bootstrap(void)
     /* Use first page as the CoW zero page */
     memset(&_text, 0, PAGE_SIZE);
     mfn_zero = virt_to_mfn((unsigned long) &_text);
-    if ( (rc = HYPERVISOR_update_va_mapping(0, nullpte, UVMF_INVLPG)) )
-        printk("Unable to unmap NULL page. rc=%d\n", rc);
+    if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+        if ( (rc = HYPERVISOR_update_va_mapping(0, nullpte, UVMF_INVLPG)) )
+            printk("Unable to unmap NULL page. rc=%d\n", rc);
+    }
+    else {
+        pgentry_t *pgt = need_pgt(0, 0, 0);
+        *pgt = 0;
+        flush_tlb_single(0);
+    }
 }
 
 /* P2M map bits and pieces
@@ -902,6 +933,9 @@ void arch_rebuild_p2m()
 
 void arch_init_p2m(unsigned long max_pfn)
 {
+    if (xen_feature(XENFEAT_auto_translated_physmap))
+        return;
+
     pages_to_alloc = max_pfn / (L1_P2M_ENTRIES * L2_P2M_ENTRIES) + 2;
 
     if(pages_to_alloc > 4096) 
